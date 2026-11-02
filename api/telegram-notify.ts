@@ -174,43 +174,152 @@ function parseBody(body: unknown): Record<string, unknown> | null {
   }
 }
 
+type TelegramApiResult = {
+  ok?: boolean;
+  description?: string;
+  error_code?: number;
+};
+
+type TelegramSendResult = {
+  ok: boolean;
+  description?: string;
+};
+
+function safeDiagnostic(value: unknown, secret?: string) {
+  const text = value instanceof Error ? value.message : String(value ?? '');
+  return (secret ? text.split(secret).join('[redacted]') : text).slice(0, 500);
+}
+
+async function sendTelegram(
+  botToken: string,
+  method: 'sendPhoto' | 'sendMessage',
+  payload: Record<string, unknown>,
+  propertyId: string,
+): Promise<TelegramSendResult> {
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const responseText = await response.text();
+    let result: TelegramApiResult | null = null;
+
+    try {
+      result = JSON.parse(responseText) as TelegramApiResult;
+    } catch {
+      // Keep the bounded response excerpt below for diagnosing malformed replies.
+    }
+
+    if (response.ok && result?.ok === true) return { ok: true };
+
+    const description = result?.description
+      ? safeDiagnostic(result.description, botToken)
+      : `Telegram returned HTTP ${response.status}`;
+    console.error('[telegram-notify] Telegram request rejected', {
+      propertyId,
+      method,
+      httpStatus: response.status,
+      telegramErrorCode: result?.error_code,
+      telegramDescription: description,
+      responseExcerpt: result ? undefined : safeDiagnostic(responseText, botToken),
+    });
+    return { ok: false, description };
+  } catch (error) {
+    const description = safeDiagnostic(error, botToken);
+    console.error('[telegram-notify] Telegram request failed before a response', {
+      propertyId,
+      method,
+      error: description,
+    });
+    return { ok: false, description };
+  }
+}
+
 export default async function handler(req: ApiRequest, res: ApiResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    return res.status(405).json({ error: 'Method not allowed' });
+    return res.status(405).json({ error: 'Method not allowed', code: 'METHOD_NOT_ALLOWED' });
   }
 
   const idToken = bearerToken(req.headers.authorization);
-  if (!idToken) return res.status(401).json({ error: 'Unauthorized' });
+  if (!idToken) return res.status(401).json({ error: 'Unauthorized', code: 'MISSING_BEARER_TOKEN' });
 
-  const apiKey = process.env.VITE_FIREBASE_API_KEY;
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!apiKey || !projectId || !botToken || !chatId) {
-    return res.status(500).json({ error: 'Server notification settings are incomplete' });
+  const apiKey = process.env.VITE_FIREBASE_API_KEY?.trim();
+  const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  const chatId = process.env.TELEGRAM_CHAT_ID?.trim();
+
+  if (!apiKey || !projectId) {
+    const missingSettings = [
+      ['VITE_FIREBASE_API_KEY', apiKey],
+      ['FIREBASE_PROJECT_ID', projectId],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    console.error('[telegram-notify] Required Firebase server settings are missing', { missingSettings });
+    return res.status(500).json({
+      error: 'Server Firebase settings are incomplete',
+      code: 'FIREBASE_CONFIG_INCOMPLETE',
+      missingSettings,
+    });
   }
 
   const body = parseBody(req.body);
   const propertyId = body?.propertyId;
   if (typeof propertyId !== 'string' || !/^[A-Za-z0-9_-]{1,150}$/.test(propertyId)) {
-    return res.status(400).json({ error: 'Invalid property ID' });
+    return res.status(400).json({ error: 'Invalid property ID', code: 'INVALID_PROPERTY_ID' });
   }
 
   try {
     const staff = await authenticateStaff(idToken, apiKey, projectId);
-    if (!staff.ok) return res.status(staff.status).json({ error: staff.error });
+    if (!staff.ok) {
+      console.error('[telegram-notify] Firebase staff authentication failed', {
+        propertyId,
+        status: staff.status,
+        error: safeDiagnostic(staff.error, botToken),
+      });
+      return res.status(staff.status).json({ error: staff.error, code: 'STAFF_AUTHENTICATION_FAILED' });
+    }
 
     const firestoreBase = firestoreDocumentsUrl(projectId);
     const propertyResponse = await fetch(
       `${firestoreBase}/properties/${encodeURIComponent(propertyId)}`,
       { headers: { Authorization: `Bearer ${idToken}` } },
     );
-    if (!propertyResponse.ok) return res.status(404).json({ error: 'Property not found' });
+
+    if (!propertyResponse.ok) {
+      console.error('[telegram-notify] Firestore property lookup failed', {
+        propertyId,
+        httpStatus: propertyResponse.status,
+      });
+      if (propertyResponse.status === 404) {
+        return res.status(404).json({ error: 'Property not found', code: 'PROPERTY_NOT_FOUND' });
+      }
+      return res.status(502).json({ error: 'Unable to load property', code: 'PROPERTY_LOOKUP_FAILED' });
+    }
+
     const property = await propertyResponse.json() as FirestoreDocument;
     const fields = property.fields ?? {};
     if (stringField(fields, 'created_by_staff_id') !== staff.uid) {
-      return res.status(403).json({ error: 'Property owner required' });
+      return res.status(403).json({ error: 'Property owner required', code: 'PROPERTY_OWNER_REQUIRED' });
+    }
+
+    if (!botToken || !chatId) {
+      const missingSettings = [
+        ['TELEGRAM_BOT_TOKEN', botToken],
+        ['TELEGRAM_CHAT_ID', chatId],
+      ].filter(([, value]) => !value).map(([name]) => name);
+      console.error('[telegram-notify] Required Telegram server settings are missing', {
+        propertyId,
+        missingSettings,
+      });
+      return res.status(200).json({
+        propertyFound: true,
+        notificationSent: false,
+        sent: false,
+        warning: 'Property is available, but Telegram notification settings are incomplete.',
+        code: 'TELEGRAM_CONFIG_INCOMPLETE',
+        missingSettings,
+      });
     }
 
     const title = limitText(stringField(fields, 'title') || 'عقار جديد', 140);
@@ -231,7 +340,6 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
 
     const apartmentLines = isApartment
       ? [
-          '',
           ...[
             ['غرف النوم', ['bedrooms', 'bedroom_count', 'rooms']],
             ['الصالات', ['lounges', 'living_rooms', 'halls']],
@@ -242,17 +350,33 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
             return value
               ? `${label}: ${escapeHtml(formatNumericText(limitText(value, 30)))}`
               : '';
-          }),
+          }).filter(Boolean),
         ]
       : [];
 
-    const message = [
+    const apartmentPlainLines = isApartment
+      ? [
+          ...[
+            ['غرف النوم', ['bedrooms', 'bedroom_count', 'rooms']],
+            ['الصالات', ['lounges', 'living_rooms', 'halls']],
+            ['المطابخ', ['kitchens', 'kitchen_count']],
+            ['دورات المياه', ['bathrooms', 'bathroom_count', 'baths']],
+          ].map(([label, keys]) => {
+            const value = firstTextField(fields, keys as string[]);
+            return value
+              ? `${label}: ${formatNumericText(limitText(value, 30))}`
+              : '';
+          }).filter(Boolean),
+        ]
+      : [];
+
+    const htmlMessage = [
       '<b>🏡 إعلان عقاري جديد</b>',
       `<b>${escapeHtml(title)}</b>`,
       `النوع: ${escapeHtml(propertyType)} — ${listingLabel}`,
       `السعر: ${price}`,
       area ? `المساحة: ${escapeHtml(area)}` : '',
-      ...apartmentLines,
+      ...apartmentLines.map((line) => `\n${line}`),
       city || district
         ? `الموقع: ${escapeHtml([city, district].filter(Boolean).join(' — '))}`
         : '',
@@ -262,37 +386,83 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       '',
       `<a href="${escapeHtml(detailsUrl)}">عرض تفاصيل العقار</a>`,
     ].filter(Boolean).flat().join('\n');
-    const imageUrl = firstImageUrl(fields);
-    const telegramMethod = imageUrl ? 'sendPhoto' : 'sendMessage';
-    const telegramPayload = imageUrl
-      ? {
-          chat_id: chatId,
-          photo: imageUrl,
-          caption: message,
-          parse_mode: 'HTML',
-        }
-      : {
-          chat_id: chatId,
-          text: message,
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-        };
 
-    const telegramResponse = await fetch(
-      `https://api.telegram.org/bot${botToken}/${telegramMethod}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(telegramPayload),
-      },
-    );
-    const telegramResult = await telegramResponse.json() as { ok?: boolean };
-    if (!telegramResponse.ok || telegramResult.ok !== true) {
-      return res.status(502).json({ error: 'Telegram rejected the message' });
+    const plainMessage = [
+      '🏡 إعلان عقاري جديد',
+      title,
+      `النوع: ${propertyType} — ${listingLabel}`,
+      `السعر: ${price}`,
+      area ? `المساحة: ${area}` : '',
+      ...apartmentPlainLines,
+      city || district
+        ? `الموقع: ${[city, district].filter(Boolean).join(' — ')}`
+        : '',
+      serialNumber
+        ? `رقم الإعلان: ${new Intl.NumberFormat('ar-SA').format(serialNumber)}`
+        : '',
+      '',
+      `عرض تفاصيل العقار: ${detailsUrl}`,
+    ].filter(Boolean).flat().join('\n');
+
+    const imageUrl = firstImageUrl(fields);
+    const textPayload = {
+      chat_id: chatId,
+      text: limitText(plainMessage, 4000),
+      disable_web_page_preview: true,
+    };
+
+    let telegramResult: TelegramSendResult;
+
+    if (imageUrl && Array.from(htmlMessage).length <= 1024) {
+      telegramResult = await sendTelegram(botToken, 'sendPhoto', {
+        chat_id: chatId,
+        photo: imageUrl,
+        caption: htmlMessage,
+        parse_mode: 'HTML',
+      }, propertyId);
+
+      if (!telegramResult.ok) {
+        console.error('[telegram-notify] Falling back from sendPhoto to sendMessage', {
+          propertyId,
+          reason: telegramResult.description,
+        });
+        telegramResult = await sendTelegram(botToken, 'sendMessage', textPayload, propertyId);
+      }
+    } else {
+      if (imageUrl) {
+        console.error('[telegram-notify] Photo caption exceeds Telegram limit; using sendMessage', {
+          propertyId,
+          captionCharacters: Array.from(htmlMessage).length,
+          maximumCaptionCharacters: 1024,
+        });
+      }
+      telegramResult = await sendTelegram(botToken, 'sendMessage', textPayload, propertyId);
     }
 
-    return res.status(200).json({ sent: true });
-  } catch {
-    return res.status(502).json({ error: 'Notification service unavailable' });
+    if (!telegramResult.ok) {
+      // The property already exists in Firestore; notification delivery is best-effort.
+      return res.status(200).json({
+        propertyFound: true,
+        notificationSent: false,
+        sent: false,
+        warning: 'Property is available, but the Telegram notification could not be delivered.',
+        code: 'TELEGRAM_DELIVERY_FAILED',
+      });
+    }
+
+    return res.status(200).json({
+      propertyFound: true,
+      notificationSent: true,
+      sent: true,
+    });
+  } catch (error) {
+    console.error('[telegram-notify] Unexpected request failure', {
+      propertyId,
+      error: safeDiagnostic(error, botToken),
+    });
+    return res.status(502).json({
+      error: 'Notification service unavailable',
+      code: 'NOTIFICATION_SERVICE_UNAVAILABLE',
+    });
   }
 }
