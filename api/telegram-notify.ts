@@ -23,19 +23,17 @@ type FirestoreDocument = {
 type RentPeriod = 'monthly' | 'annual' | 'two_installments';
 
 const PRODUCTION_APP_URL = 'https://durrattest18.vercel.app';
-const TELEGRAM_CAPTION_LIMIT = 1024;
-const TELEGRAM_TEXT_LIMIT = 4096;
 
 const rentPeriodPriceText: Record<RentPeriod, string> = {
   monthly: 'شهرياً',
   annual: 'سنوياً',
-  two_installments: 'للدفعة الواحدة',
+  two_installments: 'على الدفعة الواحدة',
 };
 
 const rentPeriodLabelText: Record<RentPeriod, string> = {
-  monthly: 'إيجار شهري',
-  annual: 'إيجار سنوي',
-  two_installments: 'إيجار على دفعتين',
+  monthly: 'شهري',
+  annual: 'سنوي',
+  two_installments: 'على دفعتين',
 };
 
 function stringField(fields: Record<string, FirestoreValue>, name: string) {
@@ -107,11 +105,6 @@ function isRentListing(fields: Record<string, FirestoreValue>) {
   return values.some((value) => /(?:^|[^a-z])(?:monthly|month|annual|yearly|year)(?:$|[^a-z])|شهري|شهر|سنوي|سنة/i.test(normalizedLabel(value)));
 }
 
-function isApartmentType(propertyType: string) {
-  const normalizedType = propertyType.toLowerCase();
-  return normalizedType.includes('apartment') || propertyType.includes('شقة') || propertyType.includes('شقق');
-}
-
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => {
     const entities: Record<string, string> = {
@@ -129,10 +122,11 @@ function limitText(value: string, maxCharacters: number) {
   return Array.from(value.trim()).slice(0, maxCharacters).join('');
 }
 
-function isHttpsUrl(value: string) {
+function isDirectImageUrl(value: string) {
   if (!value || value.length > 2048) return false;
   try {
-    return new URL(value).protocol === 'https:';
+    const protocol = new URL(value).protocol;
+    return protocol === 'https:' || protocol === 'http:';
   } catch {
     return false;
   }
@@ -142,7 +136,7 @@ function imageUrlFromValue(value?: FirestoreValue): string {
   if (!value) return '';
 
   const directValue = typeof value.stringValue === 'string' ? value.stringValue.trim() : '';
-  if (directValue && isHttpsUrl(directValue)) return directValue;
+  if (directValue && isDirectImageUrl(directValue)) return directValue;
 
   const nestedFields = value.mapValue?.fields;
   if (!nestedFields) return '';
@@ -150,7 +144,7 @@ function imageUrlFromValue(value?: FirestoreValue): string {
   for (const key of ['url', 'imageUrl', 'image_url', 'src', 'downloadURL', 'downloadUrl']) {
     const candidate = nestedFields[key];
     const directCandidate = candidate?.stringValue?.trim() ?? '';
-    if (directCandidate && isHttpsUrl(directCandidate)) return directCandidate;
+    if (directCandidate && isDirectImageUrl(directCandidate)) return directCandidate;
     const nestedCandidate = imageUrlFromValue(candidate);
     if (nestedCandidate) return nestedCandidate;
   }
@@ -180,69 +174,6 @@ function parseBody(body: unknown): Record<string, unknown> | null {
   }
 }
 
-async function sendTelegram(botToken: string, method: 'sendPhoto' | 'sendMessage', payload: Record<string, unknown>) {
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => ({})) as { ok?: boolean };
-    return response.ok && result.ok === true;
-  } catch {
-    return false;
-  }
-}
-
-function buildMessage(fields: Record<string, FirestoreValue>, propertyId: string) {
-  const title = limitText(stringField(fields, 'title') || 'عقار جديد', 140);
-  const propertyType = limitText(stringField(fields, 'property_type') || 'غير محدد', 60);
-  const isRent = isRentListing(fields);
-  const rentPeriod = rentPeriodFromFields(fields);
-  const listingLabel = isRent ? rentPeriodLabelText[rentPeriod] : 'للبيع';
-  const priceValue = new Intl.NumberFormat('ar-SA').format(numberField(fields, 'price'));
-  const priceSuffix = isRent ? ` ${rentPeriodPriceText[rentPeriod]}` : '';
-  const city = limitText(stringField(fields, 'city'), 60);
-  const district = limitText(stringField(fields, 'district'), 60);
-  const serialNumber = numberField(fields, 'serial_number');
-  const advertiserName = limitText(
-    stringField(fields, 'publisher_name') || stringField(fields, 'created_by_name') || 'غير محدد',
-    80,
-  );
-  const area = areaText(fields);
-  const detailsUrl = `${PRODUCTION_APP_URL}/?property=${encodeURIComponent(propertyId)}`;
-
-  const apartmentLines = isApartmentType(propertyType)
-    ? [
-        ['غرف النوم', ['bedrooms', 'bedroom_count', 'rooms']],
-        ['الصالات', ['lounges', 'living_rooms', 'halls']],
-        ['المطابخ', ['kitchens', 'kitchen_count']],
-        ['دورات المياه', ['bathrooms', 'bathroom_count', 'baths']],
-      ].flatMap(([label, keys]) => {
-        const value = firstTextField(fields, keys as string[]);
-        return value ? [`${label}: ${escapeHtml(formatNumericText(limitText(value, 30)))}`] : [];
-      })
-    : [];
-
-  return [
-    '<b>🏡 إعلان عقاري جديد</b>',
-    `<b>${escapeHtml(title)}</b>`,
-    `النوع: ${escapeHtml(propertyType)} — ${escapeHtml(listingLabel)}`,
-    `السعر: ${escapeHtml(priceValue)} ر.س${escapeHtml(priceSuffix)}`,
-    area ? `المساحة: ${escapeHtml(area)}` : '',
-    ...apartmentLines,
-    city || district
-      ? `الموقع: ${escapeHtml([city, district].filter(Boolean).join(' — '))}`
-      : '',
-    '',
-    `المعلن: ${escapeHtml(advertiserName)}`,
-    serialNumber
-      ? `رقم الإعلان: ${new Intl.NumberFormat('ar-SA').format(serialNumber)}`
-      : '',
-    `<a href="${escapeHtml(detailsUrl)}">معاينة العقار على الموقع</a>`,
-  ].filter(Boolean).join('\n');
-}
-
 export default async function handler(req: ApiRequest, res: ApiResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
@@ -270,8 +201,9 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     const staff = await authenticateStaff(idToken, apiKey, projectId);
     if (!staff.ok) return res.status(staff.status).json({ error: staff.error });
 
+    const firestoreBase = firestoreDocumentsUrl(projectId);
     const propertyResponse = await fetch(
-      `${firestoreDocumentsUrl(projectId)}/properties/${encodeURIComponent(propertyId)}`,
+      `${firestoreBase}/properties/${encodeURIComponent(propertyId)}`,
       { headers: { Authorization: `Bearer ${idToken}` } },
     );
     if (!propertyResponse.ok) return res.status(404).json({ error: 'Property not found' });
@@ -281,31 +213,85 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       return res.status(403).json({ error: 'Property owner required' });
     }
 
-    const message = buildMessage(fields, propertyId);
+    const title = limitText(stringField(fields, 'title') || 'عقار جديد', 140);
+    const propertyType = limitText(stringField(fields, 'property_type') || 'غير محدد', 60);
+    const rentPeriod = rentPeriodFromFields(fields);
+    const isRent = isRentListing(fields);
+    const listingLabel = isRent ? `للإيجار (${rentPeriodLabelText[rentPeriod]})` : 'للبيع';
+    const price = `${new Intl.NumberFormat('ar-SA').format(numberField(fields, 'price'))} ر.س${isRent ? ` ${rentPeriodPriceText[rentPeriod]}` : ''}`;
+    const city = limitText(stringField(fields, 'city'), 60);
+    const district = limitText(stringField(fields, 'district'), 60);
+    const serialNumber = numberField(fields, 'serial_number');
+    const area = areaText(fields);
+    const detailsUrl = `${PRODUCTION_APP_URL}/?property=${encodeURIComponent(propertyId)}`;
+    const normalizedType = propertyType.toLowerCase();
+    const isApartment = normalizedType.includes('apartment')
+      || propertyType.includes('شقة')
+      || propertyType.includes('شقق');
+
+    const apartmentLines = isApartment
+      ? [
+          '',
+          ...[
+            ['غرف النوم', ['bedrooms', 'bedroom_count', 'rooms']],
+            ['الصالات', ['lounges', 'living_rooms', 'halls']],
+            ['المطابخ', ['kitchens', 'kitchen_count']],
+            ['دورات المياه', ['bathrooms', 'bathroom_count', 'baths']],
+          ].map(([label, keys]) => {
+            const value = firstTextField(fields, keys as string[]);
+            return value
+              ? `${label}: ${escapeHtml(formatNumericText(limitText(value, 30)))}`
+              : '';
+          }),
+        ]
+      : [];
+
+    const message = [
+      '<b>🏡 إعلان عقاري جديد</b>',
+      `<b>${escapeHtml(title)}</b>`,
+      `النوع: ${escapeHtml(propertyType)} — ${listingLabel}`,
+      `السعر: ${price}`,
+      area ? `المساحة: ${escapeHtml(area)}` : '',
+      ...apartmentLines,
+      city || district
+        ? `الموقع: ${escapeHtml([city, district].filter(Boolean).join(' — '))}`
+        : '',
+      serialNumber
+        ? `رقم الإعلان: ${new Intl.NumberFormat('ar-SA').format(serialNumber)}`
+        : '',
+      '',
+      `<a href="${escapeHtml(detailsUrl)}">عرض تفاصيل العقار</a>`,
+    ].filter(Boolean).flat().join('\n');
     const imageUrl = firstImageUrl(fields);
+    const telegramMethod = imageUrl ? 'sendPhoto' : 'sendMessage';
+    const telegramPayload = imageUrl
+      ? {
+          chat_id: chatId,
+          photo: imageUrl,
+          caption: message,
+          parse_mode: 'HTML',
+        }
+      : {
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        };
 
-    if (imageUrl && message.length <= TELEGRAM_CAPTION_LIMIT) {
-      const sentAsPhoto = await sendTelegram(botToken, 'sendPhoto', {
-        chat_id: chatId,
-        photo: imageUrl,
-        caption: message,
-        parse_mode: 'HTML',
-      });
-      if (sentAsPhoto) return res.status(200).json({ sent: true, method: 'sendPhoto' });
+    const telegramResponse = await fetch(
+      `https://api.telegram.org/bot${botToken}/${telegramMethod}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(telegramPayload),
+      },
+    );
+    const telegramResult = await telegramResponse.json() as { ok?: boolean };
+    if (!telegramResponse.ok || telegramResult.ok !== true) {
+      return res.status(502).json({ error: 'Telegram rejected the message' });
     }
 
-    if (message.length > TELEGRAM_TEXT_LIMIT) {
-      return res.status(502).json({ error: 'Notification message is too long' });
-    }
-    const sentAsText = await sendTelegram(botToken, 'sendMessage', {
-      chat_id: chatId,
-      text: message,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-    });
-    if (!sentAsText) return res.status(502).json({ error: 'Telegram rejected the message' });
-
-    return res.status(200).json({ sent: true, method: 'sendMessage' });
+    return res.status(200).json({ sent: true });
   } catch {
     return res.status(502).json({ error: 'Notification service unavailable' });
   }
